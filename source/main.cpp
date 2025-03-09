@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <vector>
 #include <random>
+#include <alsa/asoundlib.h>
 #include "dumb_buffer.h"
 #include "ffmpeg_file.h"
 #include "ffmpeg_scale.h"
@@ -20,9 +21,13 @@ int g_front_buffer = 0;
 drmModeCrtc* g_old_crtc;
 int g_frame_nr = 0;
 FFMPEG_FILE* ffmpeg_file = nullptr;
+std::thread* audio_T = nullptr;
+bool audio_close = false;
+const char* audio_device = "default";
 
 void draw();
 void flip_handler(int fd, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void* user_data);
+void audio_playback_T();
 
 void sigint_handler(int sig) {
 
@@ -33,6 +38,12 @@ void sigint_handler(int sig) {
 	g_dumb_buffers.clear();
 	close(g_card_fd);
 
+	// -- Join audio playback thread
+	audio_close = true;
+	audio_T->join();
+	delete audio_T;
+
+	ffmpeg_file->StopAsyncDecode();
     delete ffmpeg_file;
 
 	exit(0);
@@ -64,6 +75,7 @@ int main(int argc, const char* argv[]) {
     // -- Open video file 
     
     ffmpeg_file = new FFMPEG_FILE(argv[2]);
+	ffmpeg_file->AsyncDecode();
 
 	// TODO: check for dumb buffer capabilities
 
@@ -147,6 +159,9 @@ int main(int argc, const char* argv[]) {
 	// -- First draw
 
 	draw();
+
+	// -- Start audio playback thread
+	audio_T = new std::thread(audio_playback_T);
 
 	while (1) {
 		drmHandleEvent(g_card_fd, &event_context);
@@ -257,8 +272,8 @@ void draw() {
     // -- Video draw
     
     uint8_t* buf = nullptr;
-    AVFrame* src_frame = ffmpeg_file->Read();
-    AVFrame* dst_frame = FFMPEG_SCALE::RGB24(src_frame, ffmpeg_file->codec_context, &buf);
+    AVFrame* src_frame = ffmpeg_file->AsyncReadVideo();
+    AVFrame* dst_frame = FFMPEG_SCALE::RGB(src_frame, ffmpeg_file->video_codec_context, &buf, AV_PIX_FMT_RGBA);
 
 	for (int i = 0; i < dst_frame->height; ++i) {
 		uint8_t* pixel_ptr = (dst_frame->data[0] + i * dst_frame->linesize[0]);
@@ -289,5 +304,61 @@ void flip_handler(int fd, unsigned int sequence, unsigned int tv_sec, unsigned i
 
 }
 
+void audio_playback_T() {
 
+	int err;
+	unsigned int i;
+	snd_pcm_t *handle;
+	snd_pcm_sframes_t frames;
+
+	if ((err = snd_pcm_open(&handle, audio_device, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+		printf("Playback open error: %s\n", snd_strerror(err));
+		return;
+	}
+
+	if ((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 6, 48000, 1, 500000)) < 0) {   /* 0.5sec */
+		printf("Playback open error: %s\n", snd_strerror(err));
+		return;
+	}
+
+	AVFrame* frame = nullptr;
+
+	while (!audio_close) {
+
+		frame = ffmpeg_file->AsyncReadAudio(); 
+
+		int sample_size = av_get_bytes_per_sample(static_cast<AVSampleFormat>(frame->format));
+		int buffer_size = sample_size * frame->ch_layout.nb_channels * frame->nb_samples;
+		int padded_buffer_size = ((buffer_size / 4096) * 4096) + 4096;
+		uint8_t buf[padded_buffer_size];
+		uint8_t* buf_pos = &buf[0];
+		int offset = 0;
+
+		for (int i = 0; i < frame->nb_samples; ++i) {
+			for (int j = 0; j < frame->ch_layout.nb_channels; ++j) {
+				memcpy(buf_pos, &frame->extended_data[j][offset], sample_size);
+				buf_pos += sample_size;
+			}
+			offset += sample_size;
+		}
+
+		frames = snd_pcm_writei(handle, buf, frame->nb_samples);
+		if (frames < 0) frames = snd_pcm_recover(handle, frames, 0);
+		if (frames < 0) {
+			printf("snd_pcm_writei failed: %s\n", snd_strerror(frames));
+			audio_close = true;
+		}
+		// if (frames > 0 && frames < (long)sizeof(buffer)) printf("Short write (expected %li, wrote %li)\n", (long)sizeof(buffer), frames);
+	
+	}
+
+	err = snd_pcm_drain(handle);
+	if (err < 0) printf("snd_pcm_drain failed: %s\n", snd_strerror(err));
+	snd_pcm_close(handle);
+
+	if (frame != nullptr) av_frame_free(&frame);
+
+	return;
+
+}
 

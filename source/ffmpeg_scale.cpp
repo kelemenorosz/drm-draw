@@ -3,7 +3,7 @@
 
 using namespace FFMPEG_SCALE;
 
-AVFrame* FFMPEG_SCALE::RGB24(AVFrame* src, AVCodecContext* codec, uint8_t** buf) {
+AVFrame* FFMPEG_SCALE::RGB(AVFrame* src, AVCodecContext* codec, uint8_t** buf, AVPixelFormat format) {
 
 /*
 	const char* str = av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format));
@@ -16,7 +16,7 @@ AVFrame* FFMPEG_SCALE::RGB24(AVFrame* src, AVCodecContext* codec, uint8_t** buf)
 
 	// -- Create sws context
 
-	sws_context = sws_getContext(codec->width, codec->height, codec->pix_fmt, codec->width, codec->height, AV_PIX_FMT_BGRA, SWS_BICUBIC, NULL, NULL, NULL);
+	sws_context = sws_getContext(codec->width, codec->height, codec->pix_fmt, codec->width, codec->height, format, SWS_BICUBIC, NULL, NULL, NULL);
 
 	// -- Setup destination frame
 
@@ -28,12 +28,12 @@ AVFrame* FFMPEG_SCALE::RGB24(AVFrame* src, AVCodecContext* codec, uint8_t** buf)
 
 	dst_frame->width = codec->width;
 	dst_frame->height = codec->height;
-	int dst_buf_size = av_image_get_buffer_size(AV_PIX_FMT_BGRA, dst_frame->width, dst_frame->height, 1);
+	int dst_buf_size = av_image_get_buffer_size(format, dst_frame->width, dst_frame->height, 1);
 
 	printf("Destination frame buffer size: %d.\n", dst_buf_size);
 
 	uint8_t* dst_buf = (uint8_t*)av_mallocz(dst_buf_size);
-	if (av_image_fill_arrays(dst_frame->data, dst_frame->linesize, dst_buf, AV_PIX_FMT_BGRA, codec->width, codec->height, 1) < 0) {
+	if (av_image_fill_arrays(dst_frame->data, dst_frame->linesize, dst_buf, format, codec->width, codec->height, 1) < 0) {
 		printf("av_image_fill_arrays failed.\n");
 		av_freep(reinterpret_cast<void*>(dst_buf));
 		av_frame_free(&dst_frame);

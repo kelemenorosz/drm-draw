@@ -11,7 +11,7 @@ add_executable(
     ffmpeg_scale.cpp
 )
 
-pkg_check_modules(LIBDRM REQUIRED libdrm libavutil libavcodec libavformat libswscale libswresample)
+pkg_check_modules(LIBDRM REQUIRED libdrm alsa libavutil libavcodec libavformat libswscale libswresample)
 cmake_print_variables(LIBDRM_CFLAGS LIBDRM_LDFLAGS LIBDRM_LINK_LIBRARIES LIBDRM_LIBRARIES)
 
 target_compile_options(drmdraw PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${LIBDRM_CFLAGS}>)
