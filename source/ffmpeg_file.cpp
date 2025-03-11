@@ -136,6 +136,11 @@ FFMPEG_FILE::FFMPEG_FILE(const char* src) : recv_packet_MTX(nullptr), send_packe
 	str = avcodec_get_name(audio_codec_context->codec_id);
 	printf("Decoder name: %s.\n", str);
 
+	AVRational* frame_rate_av_r = &format_context->streams[video_stream_index]->r_frame_rate;
+	float frame_rate = static_cast<float>(frame_rate_av_r->num) / static_cast<float>(frame_rate_av_r->den);
+	printf("Video stream frame rate: %f.\n", frame_rate);
+	video_fps = frame_rate;
+
 	recv_frame = av_frame_alloc();
 	if (recv_frame == NULL) {
 		printf("Failed to allocate receive frame.\n");
@@ -355,18 +360,21 @@ void FFMPEG_FILE::StopAsyncDecode() {
 
 	{
 		std::unique_lock<std::mutex> u_lock(*recv_packet_MTX);
+		printf("Unlocking AsyncRecvPacket_T.\n");
 		recv_packet_blk = false;
 		recv_packet_CV->notify_all();
 	}
-
+	printf("FOO.\n");
 	{
 		std::unique_lock<std::mutex> u_lock(*send_packet_video_MTX);
+		printf("Unlocking AsyncSendPacketVideo_T.\n");
 		send_packet_video_blk = false;
 		send_packet_video_CV->notify_all();
 	}
-
+	printf("BAR.\n");
 	{
 		std::unique_lock<std::mutex> u_lock(*send_packet_audio_MTX);
+		printf("Unlocking AsyncSendPacketAudio_T.\n");
 		send_packet_audio_blk = false;
 		send_packet_audio_CV->notify_all();
 	}
@@ -488,7 +496,7 @@ void FFMPEG_FILE::AsyncSendPacketAudio_T() {
 		}
 
 		if (ret == 0) {
-			printf("Sending audio packet.\n");
+			// printf("Sending audio packet.\n");
 			av_packet_unref(&audio_queue.front());
 			audio_queue.pop();
 		}
@@ -565,10 +573,15 @@ AVFrame* FFMPEG_FILE::AsyncReadVideo() {
     }
 
 	av_frame_ref(frame, recv_frame_video);
-
-	std::unique_lock<std::mutex> u_lock(*send_packet_video_MTX);
-	send_packet_video_blk = false;
-	send_packet_video_CV->notify_all();
+	
+	// TODO: If CTRL+C is hit then the mutex remains locked.
+	// StopAsyncDecode() hangs.
+	{
+		std::unique_lock<std::mutex> u_lock(*send_packet_video_MTX);
+		printf("Unlocking AsyncSendPacketVideo_T.\n");
+		send_packet_video_blk = false;
+		send_packet_video_CV->notify_all();
+	}
 
     return frame;
 
@@ -588,7 +601,7 @@ AVFrame* FFMPEG_FILE::AsyncReadAudio() {
         if (ret != 0) {
             if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
                 std::unique_lock<std::mutex> u_lock(*send_packet_audio_MTX);
-                printf("Frame not yet available.\n");
+                // printf("Frame not yet available.\n");
                 send_packet_audio_blk = false;
                 send_packet_audio_CV->notify_all();
             }
@@ -619,10 +632,13 @@ AVFrame* FFMPEG_FILE::AsyncReadAudio() {
 
 	av_frame_ref(frame, recv_frame_audio);
 
-	std::unique_lock<std::mutex> u_lock(*send_packet_audio_MTX);
-	send_packet_audio_blk = false;
-	send_packet_audio_CV->notify_all();
-
+	{
+		std::unique_lock<std::mutex> u_lock(*send_packet_audio_MTX);
+		printf("Unlocking AsyncSendPacketAudio_T.\n");
+		send_packet_audio_blk = false;
+		send_packet_audio_CV->notify_all();
+	}
+	
     return frame;
 
 }

@@ -24,6 +24,11 @@ FFMPEG_FILE* ffmpeg_file = nullptr;
 std::thread* audio_T = nullptr;
 bool audio_close = false;
 const char* audio_device = "default";
+bool process_close = false;
+std::chrono::high_resolution_clock::time_point t0;
+double elapsed_time = 0.0f;
+AVFrame* current_frame = nullptr;
+uint8_t* current_frame_buf = nullptr;
 
 void draw();
 void flip_handler(int fd, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void* user_data);
@@ -32,21 +37,10 @@ void audio_playback_T();
 void sigint_handler(int sig) {
 
 	signal(sig, SIG_IGN);
-	
-	drmModeSetCrtc(g_card_fd, g_old_crtc->crtc_id, g_old_crtc->buffer_id, g_old_crtc->x, g_old_crtc->y, &g_connectors[0]->connector_id, 1, &g_old_crtc->mode);
 
-	g_dumb_buffers.clear();
-	close(g_card_fd);
+	process_close = true;
 
-	// -- Join audio playback thread
-	audio_close = true;
-	audio_T->join();
-	delete audio_T;
-
-	ffmpeg_file->StopAsyncDecode();
-    delete ffmpeg_file;
-
-	exit(0);
+	return;
 
 }
 
@@ -156,6 +150,10 @@ int main(int argc, const char* argv[]) {
 
 	timeout.tv_sec = 5;
 
+	// -- Start clock
+
+	t0 = std::chrono::high_resolution_clock::now();
+
 	// -- First draw
 
 	draw();
@@ -163,11 +161,11 @@ int main(int argc, const char* argv[]) {
 	// -- Start audio playback thread
 	audio_T = new std::thread(audio_playback_T);
 
-	while (1) {
-		drmHandleEvent(g_card_fd, &event_context);
-	}
+	// while (!process_close) {
+	// 	drmHandleEvent(g_card_fd, &event_context);
+	// }
 
-	while (1) {
+	while (!process_close) {
 
 		FD_SET(g_card_fd, &fds);
 		int select_ret = select(g_card_fd + 1, &fds, NULL, NULL, &timeout);
@@ -183,9 +181,23 @@ int main(int argc, const char* argv[]) {
 	}
 
 	drmModeSetCrtc(g_card_fd, g_old_crtc->crtc_id, g_old_crtc->buffer_id, g_old_crtc->x, g_old_crtc->y, &g_connectors[0]->connector_id, 1, &g_old_crtc->mode);
+
 	g_dumb_buffers.clear();
 	close(g_card_fd);
-			
+
+	// -- Join audio playback thread
+	audio_close = true;
+	audio_T->join();
+	delete audio_T;
+
+	ffmpeg_file->StopAsyncDecode();
+	delete ffmpeg_file;
+
+	if (current_frame != nullptr) {
+		av_freep(reinterpret_cast<void*>(&current_frame_buf));
+		av_frame_free(&current_frame);
+	}
+
 	return 0;
 
 }
@@ -193,7 +205,7 @@ int main(int argc, const char* argv[]) {
 void draw() {
 
 	DUMB_BUFFER* dumb_buffer = &g_dumb_buffers[g_front_buffer];
-       	g_front_buffer ^= 1;	
+	g_front_buffer ^= 1;
 
 /*
 	float sin_y, sin_0;
@@ -269,29 +281,40 @@ void draw() {
 	*/
 
 
-    // -- Video draw
-    
-    uint8_t* buf = nullptr;
-    AVFrame* src_frame = ffmpeg_file->AsyncReadVideo();
-    AVFrame* dst_frame = FFMPEG_SCALE::RGB(src_frame, ffmpeg_file->video_codec_context, &buf, AV_PIX_FMT_RGBA);
+	// -- Video draw
 
-	for (int i = 0; i < dst_frame->height; ++i) {
-		uint8_t* pixel_ptr = (dst_frame->data[0] + i * dst_frame->linesize[0]);
-		int fb_offset = i * dumb_buffer->pitch;
-        memcpy(dumb_buffer->fb + fb_offset, pixel_ptr, dst_frame->width*4);
+	std::chrono::high_resolution_clock::time_point t1;
+	std::chrono::duration<long long, std::nano> delta = t1 - t0;
+	t0 = t1;
+
+	elapsed_time += delta.count() * 1e-9;
+	if (current_frame == nullptr || elapsed_time >= ffmpeg_file->video_fps) {
+		if (elapsed_time >= ffmpeg_file->video_fps) elapsed_time -= ffmpeg_file->video_fps;
+
+		if (current_frame != nullptr) {
+			av_freep(reinterpret_cast<void*>(&current_frame_buf));
+			av_frame_free(&current_frame);
+		}
+
+		AVFrame* src_frame = ffmpeg_file->AsyncReadVideo();
+		AVFrame* current_frame = FFMPEG_SCALE::RGB(src_frame, ffmpeg_file->video_codec_context, &current_frame_buf, AV_PIX_FMT_BGRA);
+		av_frame_free(&src_frame);
+
 	}
 
+	for (int i = 0; i < current_frame->height; ++i) {
+		uint8_t* pixel_ptr = (current_frame->data[0] + i * current_frame->linesize[0]);
+		int fb_offset = i * dumb_buffer->pitch;
+		memcpy(dumb_buffer->fb + fb_offset, pixel_ptr, current_frame->width*4);
+	}
 
-	av_freep(reinterpret_cast<void*>(&buf));
-    av_frame_free(&src_frame);
-    av_frame_free(&dst_frame);
 
 	g_frame_nr++;
 
 	printf("%d\n", g_frame_nr);
 
 	drmModePageFlip(g_card_fd, g_old_crtc->crtc_id, dumb_buffer->fb_handle, DRM_MODE_PAGE_FLIP_EVENT, NULL);
-	
+
 }
 
 void flip_handler(int fd, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void* user_data) {
