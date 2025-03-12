@@ -38,6 +38,8 @@ private:
 	int video_stream_index;
 	int audio_stream_index;
 
+	float audio_time_base;
+
 	int queue_size;
 	std::queue<AVPacket> video_queue;
 	std::queue<AVPacket> audio_queue;
@@ -66,6 +68,7 @@ public:
 	FFMPEG_FILE(const char*);
 	~FFMPEG_FILE();
 
+	void SeekAudio(int sec);
 	AVFrame* ReadVideo();
 	AVFrame* ReadAudio();
 

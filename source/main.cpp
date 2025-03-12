@@ -29,6 +29,7 @@ std::chrono::high_resolution_clock::time_point t0;
 double elapsed_time = 0.0f;
 AVFrame* current_frame = nullptr;
 uint8_t* current_frame_buf = nullptr;
+float frame_duration = 0.0f;
 
 void draw();
 void flip_handler(int fd, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void* user_data);
@@ -150,6 +151,10 @@ int main(int argc, const char* argv[]) {
 
 	timeout.tv_sec = 5;
 
+	// -- Set frame duration
+
+	frame_duration = 1.0f / ffmpeg_file->video_fps;
+
 	// -- Start clock
 
 	t0 = std::chrono::high_resolution_clock::now();
@@ -197,6 +202,9 @@ int main(int argc, const char* argv[]) {
 		av_freep(reinterpret_cast<void*>(&current_frame_buf));
 		av_frame_free(&current_frame);
 	}
+
+	printf("frame_duration: %f.\n", frame_duration);
+	printf("elapsed_time: %f.\n", elapsed_time);
 
 	return 0;
 
@@ -283,21 +291,28 @@ void draw() {
 
 	// -- Video draw
 
-	std::chrono::high_resolution_clock::time_point t1;
+	std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
 	std::chrono::duration<long long, std::nano> delta = t1 - t0;
 	t0 = t1;
 
 	elapsed_time += delta.count() * 1e-9;
-	if (current_frame == nullptr || elapsed_time >= ffmpeg_file->video_fps) {
-		if (elapsed_time >= ffmpeg_file->video_fps) elapsed_time -= ffmpeg_file->video_fps;
+	printf("elapsed_time: %f.\n", elapsed_time);
+	if (current_frame == nullptr || elapsed_time >= frame_duration) {
 
-		if (current_frame != nullptr) {
+		if (current_frame == nullptr) {
+			printf("Frist draw.\n");
+		}
+		else {
 			av_freep(reinterpret_cast<void*>(&current_frame_buf));
 			av_frame_free(&current_frame);
 		}
 
+		if (elapsed_time >= frame_duration) {
+			elapsed_time -= frame_duration;
+		}
+
 		AVFrame* src_frame = ffmpeg_file->AsyncReadVideo();
-		AVFrame* current_frame = FFMPEG_SCALE::RGB(src_frame, ffmpeg_file->video_codec_context, &current_frame_buf, AV_PIX_FMT_BGRA);
+		current_frame = FFMPEG_SCALE::RGB(src_frame, ffmpeg_file->video_codec_context, &current_frame_buf, AV_PIX_FMT_BGRA);
 		av_frame_free(&src_frame);
 
 	}
@@ -358,10 +373,22 @@ void audio_playback_T() {
 		int offset = 0;
 
 		for (int i = 0; i < frame->nb_samples; ++i) {
-			for (int j = 0; j < frame->ch_layout.nb_channels; ++j) {
-				memcpy(buf_pos, &frame->extended_data[j][offset], sample_size);
-				buf_pos += sample_size;
-			}
+			// for (int j = 0; j < frame->ch_layout.nb_channels; ++j) {
+			// 	memcpy(buf_pos, &frame->extended_data[j][offset], sample_size);
+			// 	buf_pos += sample_size;
+			// }
+			memcpy(buf_pos, &frame->extended_data[0][offset], sample_size);
+			buf_pos += sample_size;
+			memcpy(buf_pos, &frame->extended_data[1][offset], sample_size);
+			buf_pos += sample_size;
+			memcpy(buf_pos, &frame->extended_data[4][offset], sample_size);
+			buf_pos += sample_size;
+			memcpy(buf_pos, &frame->extended_data[5][offset], sample_size);
+			buf_pos += sample_size;
+			memcpy(buf_pos, &frame->extended_data[2][offset], sample_size);
+			buf_pos += sample_size;
+			memcpy(buf_pos, &frame->extended_data[3][offset], sample_size);
+			buf_pos += sample_size;
 			offset += sample_size;
 		}
 

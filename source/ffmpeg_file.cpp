@@ -141,6 +141,11 @@ FFMPEG_FILE::FFMPEG_FILE(const char* src) : recv_packet_MTX(nullptr), send_packe
 	printf("Video stream frame rate: %f.\n", frame_rate);
 	video_fps = frame_rate;
 
+	AVRational* time_base_av_r = &format_context->streams[audio_stream_index]->time_base;
+	float time_base = static_cast<float>(time_base_av_r->num) / static_cast<float>(time_base_av_r->den);
+	printf("Audio stream time base: %f.\n", time_base);
+	audio_time_base = time_base;
+
 	recv_frame = av_frame_alloc();
 	if (recv_frame == NULL) {
 		printf("Failed to allocate receive frame.\n");
@@ -192,6 +197,16 @@ FFMPEG_FILE::~FFMPEG_FILE() {
 	return;
 
 }
+
+void FFMPEG_FILE::SeekAudio(int sec) {
+
+	float timestamp_n = static_cast<float>(sec) / audio_time_base;
+	av_seek_frame(format_context, audio_stream_index, static_cast<int>(timestamp_n), 0);
+
+	return;
+
+}
+
 /*
  * Caller of Read() has to av_frame_free() the returned AVFrame*
  */
@@ -211,7 +226,7 @@ AVFrame* FFMPEG_FILE::ReadVideo() {
         ret = avcodec_receive_frame(video_codec_context, recv_frame);
         if (ret != 0) {
             if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
-                printf("Frame not yet available.\n");
+                // printf("Frame not yet available.\n");
             }
             else {
                 printf("avcodec_receive_frame failed.\n");
