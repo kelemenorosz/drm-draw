@@ -7,8 +7,9 @@ add_executable(
 	drmdraw
 	main.cpp
 	dumb_buffer.cpp
-    ffmpeg_file.cpp
-    ffmpeg_scale.cpp
+	ffmpeg_file.cpp
+	ffmpeg_stream.cpp
+	ffmpeg_scale.cpp
 )
 
 pkg_check_modules(LIBDRM REQUIRED libdrm alsa libavutil libavcodec libavformat libswscale libswresample)

@@ -1,0 +1,10 @@
+#ifndef FFMPEG_STATE_H
+#define FFMPEG_STATE_H
+
+	enum FFMPEG_STATE {
+		FF_DEFAULT = 0,
+		FF_ACTIVE,
+		FF_DECODE
+	};
+
+#endif /* FFMPEG_STATE_H */

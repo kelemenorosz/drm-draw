@@ -312,7 +312,7 @@ void draw() {
 		}
 
 		AVFrame* src_frame = ffmpeg_file->AsyncReadVideo();
-		current_frame = FFMPEG_SCALE::RGB(src_frame, ffmpeg_file->video_codec_context, &current_frame_buf, AV_PIX_FMT_BGRA);
+		current_frame = FFMPEG_SCALE::RGB(src_frame, ffmpeg_file->GetVideoCodecContext(), &current_frame_buf, AV_PIX_FMT_BGRA);
 		av_frame_free(&src_frame);
 
 	}

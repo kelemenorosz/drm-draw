@@ -1,0 +1,224 @@
+
+#include "ffmpeg_stream.h"
+
+FFMPEG_STREAM::FFMPEG_STREAM(AVStream* stream) : stream(stream), state(FF_DEFAULT), codec(nullptr), codec_ctx(nullptr), recv_frame(nullptr) {
+
+	// -- Check for codec
+
+	codec = avcodec_find_decoder(stream->codecpar->codec_id);
+	if (codec == nullptr) {
+		printf("avcodec_find_decoder failed.\n");
+		return;
+	}
+
+	// -- Allocate codec context
+
+	codec_ctx = avcodec_alloc_context3(codec);
+	if (codec_ctx == nullptr) {
+		printf("avcodec_alloc_context3 failed.\n");
+		return;
+	}
+
+	// -- Set decoder context parameters
+
+	if (avcodec_parameters_to_context(codec_ctx, stream->codecpar) < 0) {
+		printf("avcodec_parameters_to_context failed.\n");
+		return;
+	}
+
+	// -- Initialize codec context
+
+	if (avcodec_open2(codec_ctx, codec, NULL) < 0) {
+		printf("avcodec_open2 failed.\n");
+		return;
+	}
+
+	const char* str = nullptr;
+	str = av_get_pix_fmt_name(codec_ctx->pix_fmt);
+	printf("Decoder format: %s.\n", str);
+
+	str = avcodec_get_name(codec_ctx->codec_id);
+	printf("Decoder name: %s.\n", str);
+
+	recv_frame = av_frame_alloc();
+	if (recv_frame == nullptr) {
+		printf("Failed to allocate receive frame.\n");
+		return;
+	}
+
+	state = FF_ACTIVE;
+	return;
+
+}
+
+FFMPEG_STREAM::~FFMPEG_STREAM() {
+
+	if (codec_ctx != nullptr) avcodec_free_context(&codec_ctx);
+	if (recv_frame != nullptr) av_frame_free(&recv_frame);
+
+	return;
+
+}
+
+FFMPEG_STATE FFMPEG_STREAM::GetState() {
+	return state;
+}
+
+void FFMPEG_STREAM::PushQueue(AVPacket* packet) {
+	queue.push(*packet);
+	return;
+}
+
+int FFMPEG_STREAM::GetQueueSize() {
+	return queue.size();
+}
+
+AVCodecContext* FFMPEG_STREAM::GetCodecContext() {
+	return codec_ctx;
+}
+
+void FFMPEG_STREAM::AsyncDecode(std::shared_ptr<std::mutex> recv_packet_MTX, std::shared_ptr<std::condition_variable> recv_packet_CV, bool* recv_packet_BLK) {
+
+	// -- Set FFMPEG_FILE mutex and condition variable
+
+	this->recv_packet_MTX = recv_packet_MTX;
+	this->recv_packet_CV = recv_packet_CV;
+	this->recv_packet_BLK = recv_packet_BLK;
+
+	// -- Allocate FFMPEG_STREAM mutex and condition variable
+
+	send_packet_MTX = new std::mutex();
+	send_packet_CV = new std::condition_variable();
+
+	// -- Set state to FF_DECODE
+
+	state = FF_DECODE;
+
+	// -- Start async thread
+
+	send_packet_T = new std::thread(&FFMPEG_STREAM::AsyncSendPacket_T, this);
+
+	return;
+
+}
+
+void FFMPEG_STREAM::StopAsyncDecode() {
+
+	state = FF_ACTIVE;
+
+	// -- Wake up async threads
+
+	{
+		std::unique_lock<std::mutex> u_lock(*send_packet_MTX);
+		printf("Unlocking AsyncSendPacket_T.\n");
+		send_packet_BLK = false;
+		send_packet_CV->notify_all();
+	}
+
+	// -- Join async threads
+
+	if (send_packet_T != nullptr) send_packet_T->join();
+
+	return;
+
+}
+
+void FFMPEG_STREAM::AsyncSendPacket_T() {
+
+	printf("AsyncSendPacket_T started.\n");
+	int ret;
+
+	while (state == FF_DECODE) {
+
+		{
+			std::lock_guard<std::mutex> lg(*recv_packet_MTX);
+			std::lock_guard<std::mutex> lg_2(*send_packet_MTX);
+			if (queue.size() == 0) continue;
+			ret = avcodec_send_packet(codec_ctx, &queue.front());
+		}
+
+		if (ret == 0) {
+			printf("Sending packet.\n");
+			av_packet_unref(&queue.front());
+			queue.pop();
+		}
+		else if (ret == AVERROR(EAGAIN)) {
+
+			std::unique_lock<std::mutex> u_lock(*send_packet_MTX);
+			printf("Locking AsyncSendPacket_T.\n");
+			send_packet_BLK = true;
+			send_packet_CV->wait(u_lock, [this] { return !send_packet_BLK; });
+
+		}
+		else {
+			printf("AsyncSendPacket_T ERROR.\n");
+		}
+
+		if (queue.size() < 50) {
+
+			std::unique_lock<std::mutex> u_lock(*recv_packet_MTX);
+			printf("Unlocking AsyncRecvPacket_T.\n");
+			*recv_packet_BLK = false;
+			recv_packet_CV->notify_all();
+
+		}
+
+	}
+
+	printf("AsyncSendPacket_T ending.\n");
+
+	return;
+
+}
+
+AVFrame* FFMPEG_STREAM::AsyncRead() {
+
+	printf("AsyncRead().\n");
+	int ret;
+
+	while (1) {
+
+		{
+			std::lock_guard<std::mutex> lg(*send_packet_MTX);
+			ret = avcodec_receive_frame(codec_ctx, recv_frame);
+		}
+		if (ret != 0) {
+			if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
+				std::unique_lock<std::mutex> u_lock(*send_packet_MTX);
+				// printf("Frame not yet available.\n");
+				send_packet_BLK = false;
+				send_packet_CV->notify_all();
+			}
+			else {
+				printf("avcodec_receive_frame failed.\n");
+				printf("[ERROR] AsyncRead().\n");
+				return nullptr;
+			}
+		}
+		else {
+			break;
+		}
+
+	}
+
+	printf("Frame received.\n");
+
+	AVFrame* frame = av_frame_alloc();
+	if (frame == NULL) {
+		printf("Failed to allocate receive frame.\n");
+		printf("[ERROR] AsyncRead().\n");
+		return nullptr;
+	}
+
+	av_frame_ref(frame, recv_frame);
+
+	{
+		std::unique_lock<std::mutex> u_lock(*send_packet_MTX);
+		printf("Unlocking AsyncSendPacket_T.\n");
+		send_packet_BLK = false;
+		send_packet_CV->notify_all();
+	}
+
+	return frame;
+
+}
