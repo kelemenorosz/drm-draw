@@ -4,7 +4,7 @@
 #include "ffmpeg_file.h"
 extern "C" {
 	#include <libswscale/swscale.h>
-}
+} 
 
 FFMPEG_FILE::FFMPEG_FILE(const char* src) : format_ctx(nullptr), video_stream(nullptr), audio_stream(nullptr), recv_packet_MTX(nullptr), recv_packet_CV(nullptr), recv_packet_T(nullptr), recv_packet_BLK(false) {
 
@@ -72,13 +72,18 @@ FFMPEG_FILE::FFMPEG_FILE(const char* src) : format_ctx(nullptr), video_stream(nu
 	printf("Audio stream time base: %f.\n", time_base);
 	audio_time_base = time_base;
 
+	time_base_av_r = &video_stream->stream->time_base;
+	time_base = static_cast<float>(time_base_av_r->num) / static_cast<float>(time_base_av_r->den);
+	printf("Video stream time base: %f.\n", time_base);
+	video_time_base = time_base;
+
 	state = FF_ACTIVE;
 	return;
 
 }
 
 FFMPEG_FILE::~FFMPEG_FILE() {
-
+	
 	printf("video_queue.size() = %d.\n", video_stream->GetQueueSize());
 	printf("audio_queue.size() = %d.\n", audio_stream->GetQueueSize());
 
@@ -88,7 +93,7 @@ FFMPEG_FILE::~FFMPEG_FILE() {
 	if (format_ctx != NULL) avformat_close_input(&format_ctx);
 
 	if (recv_packet_T != nullptr) delete recv_packet_T;
-
+ 
 	printf("Destructing FFMPEG_FILE.\n");
 
 	return;
@@ -97,9 +102,40 @@ FFMPEG_FILE::~FFMPEG_FILE() {
 
 void FFMPEG_FILE::SeekAudio(int sec) {
 
-	// TODO: Rework this
-	// float timestamp_n = static_cast<float>(sec) / audio_time_base;
-	// av_seek_frame(format_context, audio_stream_index, static_cast<int>(timestamp_n), 0);
+	float timestamp_n = static_cast<float>(sec) / audio_time_base;
+	av_seek_frame(format_ctx, audio_stream_index, static_cast<int>(timestamp_n), 0);
+
+	return;
+
+}
+
+void FFMPEG_FILE::SeekVideo(int sec) {
+
+	printf("Seeking video.\n");
+
+	// -- Wake up RecvPacket() and stop receiveing packets
+	{
+		std::unique_lock<std::mutex> u_lock(*flush_MTX);
+		state = FF_FLUSH;
+		{
+			std::unique_lock<std::mutex> u_lock2(*recv_packet_MTX);
+			recv_packet_BLK = false;
+			recv_packet_CV->notify_all();
+		}
+		flush_BLK = true;
+		flush_CV->wait(u_lock, [this]{ return !flush_BLK; });
+	}
+
+	// -- Flush decoder
+	audio_stream->FlushDecoder();
+	video_stream->FlushDecoder();
+
+	float timestamp_n = static_cast<float>(sec) / video_time_base;
+	av_seek_frame(format_ctx, video_stream_index, static_cast<int>(timestamp_n), 0);
+
+	// -- Start decoder
+	video_stream->StartDecoder();
+	audio_stream->StartDecoder();
 
 	return;
 
@@ -115,6 +151,9 @@ void FFMPEG_FILE::AsyncDecode() {
 
 	recv_packet_MTX = std::make_shared<std::mutex>();
 	recv_packet_CV = std::make_shared<std::condition_variable>();
+
+	flush_MTX = new std::mutex();
+	flush_CV = new std::condition_variable();
 
 	// -- Set internal state to FF_DECODE
 
@@ -137,13 +176,13 @@ void FFMPEG_FILE::StopAsyncDecode() {
 
 	state = FF_ACTIVE;
 
-	printf("StopAsyncDecode().\n");
+	// printf("StopAsyncDecode().\n");
 
 	// -- Wake up async threads
 
 	{
 		std::unique_lock<std::mutex> u_lock(*recv_packet_MTX);
-		printf("Unlocking AsyncRecvPacket_T.\n");
+		// printf("Unlocking AsyncRecvPacket_T.\n");
 		recv_packet_BLK = false;
 		recv_packet_CV->notify_all();
 	}
@@ -155,11 +194,11 @@ void FFMPEG_FILE::StopAsyncDecode() {
 
 	// -- Join threads
 
-	printf("Joining threads.\n");
+	// printf("Joining threads.\n");
 
 	if (recv_packet_T != nullptr) recv_packet_T->join();
 
-	printf("Joined threads.\n");
+	// printf("Joined threads.\n");
 
 	return;
 
@@ -167,17 +206,36 @@ void FFMPEG_FILE::StopAsyncDecode() {
 
 void FFMPEG_FILE::AsyncRecvPacket_T() {
 
-	printf("AsyncRecvPacket_T started.\n");
+	// printf("AsyncRecvPacket_T started.\n");
 	AVPacket async_recv_packet;
 
-	while (av_read_frame(format_ctx, &async_recv_packet) == 0 && state == FF_DECODE) {
+	while (state == FF_DECODE || state == FF_FLUSH) {
+
+		if (state == FF_FLUSH) {
+			{
+				std::unique_lock<std::mutex> u_lock(*flush_MTX);
+				flush_BLK = false;
+				flush_CV->notify_all();
+			}
+			// -- Suspend thread
+			{
+				std::unique_lock<std::mutex> u_lock(*recv_packet_MTX);
+				recv_packet_BLK = true;
+				recv_packet_CV->wait(u_lock, [this]{ return !recv_packet_BLK; });
+			}
+		}
+
+		if (av_read_frame(format_ctx, &async_recv_packet) != 0) {
+			return;
+		}
+
 		// printf("av_read_frame() succeeded.\n");
 		if (async_recv_packet.stream_index == video_stream_index) {
 			// printf("video_queue.push().\n");
 			{
 				std::lock_guard<std::mutex> lg(*recv_packet_MTX);
 				video_stream->PushQueue(&async_recv_packet);
-				// video_queue.push(async_recv_packet);
+				// printf("video_queue.push() succeeded.\n");
 			}
 		}
 		if (async_recv_packet.stream_index == audio_stream_index) {
@@ -185,7 +243,6 @@ void FFMPEG_FILE::AsyncRecvPacket_T() {
 			{
 				std::lock_guard<std::mutex> lg(*recv_packet_MTX);
 				audio_stream->PushQueue(&async_recv_packet);
-				// audio_queue.push(async_recv_packet);
 			}
 
 		}
@@ -195,15 +252,16 @@ void FFMPEG_FILE::AsyncRecvPacket_T() {
 		if (video_stream->GetQueueSize() > 100 && audio_stream->GetQueueSize() > 100) {
 
 			std::unique_lock<std::mutex> u_lock(*recv_packet_MTX);
-			printf("Locking AsyncRecvPacket_T.\n");
+			// printf("Locking AsyncRecvPacket_T.\n");
 			recv_packet_BLK = true;
 			recv_packet_CV->wait(u_lock, [this]{ return !recv_packet_BLK; });
 
 		}
-
 	}
 
-	printf("AsyncRecvPacket_T ending.\n");
+
+
+	// printf("AsyncRecvPacket_T ending.\n");
 
 	return;
 

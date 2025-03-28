@@ -4,7 +4,9 @@
 	enum FFMPEG_STATE {
 		FF_DEFAULT = 0,
 		FF_ACTIVE,
-		FF_DECODE
+		FF_DECODE,
+		FF_FLUSH,
+		FF_SEEK
 	};
 
 #endif /* FFMPEG_STATE_H */

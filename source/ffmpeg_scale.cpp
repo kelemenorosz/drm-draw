@@ -30,7 +30,7 @@ AVFrame* FFMPEG_SCALE::RGB(AVFrame* src, AVCodecContext* codec, uint8_t** buf, A
 	dst_frame->height = codec->height;
 	int dst_buf_size = av_image_get_buffer_size(format, dst_frame->width, dst_frame->height, 1);
 
-	printf("Destination frame buffer size: %d.\n", dst_buf_size);
+	// printf("Destination frame buffer size: %d.\n", dst_buf_size);
 
 	uint8_t* dst_buf = (uint8_t*)av_mallocz(dst_buf_size);
 	if (av_image_fill_arrays(dst_frame->data, dst_frame->linesize, dst_buf, format, codec->width, codec->height, 1) < 0) {

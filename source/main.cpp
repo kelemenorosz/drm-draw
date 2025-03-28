@@ -22,24 +22,34 @@ drmModeCrtc* g_old_crtc;
 int g_frame_nr = 0;
 FFMPEG_FILE* ffmpeg_file = nullptr;
 std::thread* audio_T = nullptr;
+std::thread* video_T = nullptr;
 bool audio_close = false;
-const char* audio_device = "default";
+const char* audio_device = "YAYplug";
 bool process_close = false;
 std::chrono::high_resolution_clock::time_point t0;
 double elapsed_time = 0.0f;
 AVFrame* current_frame = nullptr;
 uint8_t* current_frame_buf = nullptr;
 float frame_duration = 0.0f;
+struct timeval timeout;
+fd_set fds;
+drmEventContext event_context;
+bool playback_paused = true;
+bool audio_dropped = false;
+int video_frames_written = 0;
 
+void PrintMenu();
 void draw();
 void flip_handler(int fd, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void* user_data);
 void audio_playback_T();
+void video_playback_T();
 
 void sigint_handler(int sig) {
 
 	signal(sig, SIG_IGN);
 
 	process_close = true;
+	audio_close = true;
 
 	return;
 
@@ -67,9 +77,10 @@ int main(int argc, const char* argv[]) {
 
 	}
 
-    // -- Open video file 
-    
-    ffmpeg_file = new FFMPEG_FILE(argv[2]);
+	// -- Open video file 
+	
+	ffmpeg_file = new FFMPEG_FILE(argv[2]);
+	// ffmpeg_file->SeekVideo(180);
 	ffmpeg_file->AsyncDecode();
 
 	// TODO: check for dumb buffer capabilities
@@ -137,10 +148,6 @@ int main(int argc, const char* argv[]) {
 	drmModeSetCrtc(g_card_fd, crtc_id, g_dumb_buffers[1].fb_handle, 0, 0, &g_connectors[0]->connector_id, 1, mode_info);
 	
 	// --
-	
-	struct timeval timeout;
-	fd_set fds;
-	drmEventContext event_context;
 
 	FD_ZERO(&fds);
 	memset(&timeout, 0, sizeof(timeout));
@@ -163,37 +170,69 @@ int main(int argc, const char* argv[]) {
 
 	draw();
 
+	playback_paused = false;
+
 	// -- Start audio playback thread
 	audio_T = new std::thread(audio_playback_T);
 
-	// while (!process_close) {
-	// 	drmHandleEvent(g_card_fd, &event_context);
-	// }
+	// -- Start video playback thread
+	video_T = new std::thread(video_playback_T);
 
+	// -- Main menu
 	while (!process_close) {
 
-		FD_SET(g_card_fd, &fds);
-		int select_ret = select(g_card_fd + 1, &fds, NULL, NULL, &timeout);
-
-		if (select_ret < 0) {
-			fprintf(stderr, "select() failed. %m\n", errno);
-			break;
+		PrintMenu();
+		std::string input_string;
+		std::string seek_string;
+		int seek_sec;
+		std::getline(std::cin, input_string);
+		if (input_string.size() == 0) {
+			// --
 		}
 		else {
-			drmHandleEvent(g_card_fd, &event_context);
+			switch(input_string.front()) {
+				case 'P':
+				case 'p':
+					std::cout << "Pausing." << std::endl;
+					playback_paused = true;
+					printf("Video frames written: %d.\n", video_frames_written);
+					printf("Video playback duration: %f.\n", static_cast<float>(video_frames_written) / ffmpeg_file->video_fps);
+					break;
+				case 'U':
+				case 'u':
+					std::cout << "Unpausing." << std::endl;
+					playback_paused = false;
+					audio_dropped = false;
+					break;
+				case 'S':
+				case 's':
+					std::cout << "Seek in seconds: ";
+					std::getline(std::cin, seek_string);
+					seek_sec = std::stoi(seek_string);
+					playback_paused = true;
+					ffmpeg_file->SeekVideo(seek_sec);
+					playback_paused = false;
+					audio_dropped = false;
+					break;
+				default:
+					std::cout << "Wrong input." << std::endl;
+			}
 		}
 
 	}
+
+	// -- Join video playback thread
+	video_T->join();
+	delete video_T;
+
+	// -- Join audio playback thread
+	audio_T->join();
+	delete audio_T;
 
 	drmModeSetCrtc(g_card_fd, g_old_crtc->crtc_id, g_old_crtc->buffer_id, g_old_crtc->x, g_old_crtc->y, &g_connectors[0]->connector_id, 1, &g_old_crtc->mode);
 
 	g_dumb_buffers.clear();
 	close(g_card_fd);
-
-	// -- Join audio playback thread
-	audio_close = true;
-	audio_T->join();
-	delete audio_T;
 
 	ffmpeg_file->StopAsyncDecode();
 	delete ffmpeg_file;
@@ -215,118 +254,59 @@ void draw() {
 	DUMB_BUFFER* dumb_buffer = &g_dumb_buffers[g_front_buffer];
 	g_front_buffer ^= 1;
 
-/*
-	float sin_y, sin_0;
-	float x, y, z;
-	uint8_t x_u8, y_u8, z_u8;
-	int offset;
-	int i, j;
-	size_t mt_max;
-	std::random_device rd;
-	std::mt19937 mersenne_twister;
-	float pi = 3.141592653589;
-	float trig_radius;
-	int trig_offset;
-
-	// -- Draw into framebuffer
-	
-	mersenne_twister.seed(rd());
-
-	mt_max = mersenne_twister.max();
-
-	memset(dumb_buffer->fb, 0x00, dumb_buffer->size);
-	
-	sin_0 = (dumb_buffer->height - 10) / 2;
-	trig_radius = (dumb_buffer->height - 10) / 2;
-	trig_offset = 0;
-	// trig_offset = (g_dumb_buffer.height - 10) / 8;
-	// trig_offset *= 3;
-
-	//printf("sin_0: %f\n", sin_0);
-	for (i = 0; i < dumb_buffer->width; ++i) {
-	
-		sin_y = sinf(pi * ((float)(i + g_frame_nr) / (trig_radius)));
-		//printf("i: %d, sin_y: %f\n", i, sin_y);
-		sin_y *= trig_radius;
-		if (sin_y > 0) sin_y = trig_radius - sin_y;
-		else sin_y = -sin_y + trig_radius;
-			
-		sin_y += trig_offset;
-
-		//printf("i: %d, sin_y: %f\n", i, sin_y);	
-
-		offset = (int)sin_y * dumb_buffer->pitch + i * 4; 
-		*(uint32_t*)&dumb_buffer->fb[offset] = 0xFF00;
-	
-
-	}
-*/
-	/* random colors */
-	/*	
-	for (i = 0; i < g_dumb_buffer.height; ++i) {
-		for (j = 0; j < g_dumb_buffer.width; ++j) {
-		
-			// -- Normalized float values
-
-			x = (float)mersenne_twister() / mt_max;
-			y = (float)mersenne_twister() / mt_max;
-			z = (float)mersenne_twister() / mt_max;
-		
-			// -- Convert them to 8-bit unsigned integers
-
-			x_u8 = 0xFF * x;
-			y_u8 = 0xFF * y;
-			z_u8 = 0xFF * z;
-			
-			// -- Set framebuffer value
-
-			offset = i * g_dumb_buffer.pitch + j * 4;
-
-			*(uint32_t*)&g_dumb_buffer.fb[offset] = (x_u8 << 0x10) | (y_u8 << 0x08) | z_u8;
-
-		}
-	}
-	*/
-
-
 	// -- Video draw
 
 	std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
 	std::chrono::duration<long long, std::nano> delta = t1 - t0;
 	t0 = t1;
 
-	elapsed_time += delta.count() * 1e-9;
-	printf("elapsed_time: %f.\n", elapsed_time);
-	if (current_frame == nullptr || elapsed_time >= frame_duration) {
+	if (!playback_paused) {
 
-		if (current_frame == nullptr) {
-			printf("Frist draw.\n");
-		}
-		else {
-			av_freep(reinterpret_cast<void*>(&current_frame_buf));
-			av_frame_free(&current_frame);
-		}
+		elapsed_time += delta.count() * 1e-9;
+		// printf("elapsed_time: %f.\n", elapsed_time);
+		if (current_frame == nullptr || elapsed_time >= frame_duration) {
 
-		if (elapsed_time >= frame_duration) {
-			elapsed_time -= frame_duration;
-		}
+			AVFrame* src_frame = nullptr;
+			src_frame = ffmpeg_file->AsyncReadVideo();
+			if (src_frame != nullptr) {
 
-		AVFrame* src_frame = ffmpeg_file->AsyncReadVideo();
-		current_frame = FFMPEG_SCALE::RGB(src_frame, ffmpeg_file->GetVideoCodecContext(), &current_frame_buf, AV_PIX_FMT_BGRA);
-		av_frame_free(&src_frame);
+				if (current_frame == nullptr) {
+					// printf("Frist draw.\n");
+				}
+				else {
+
+					av_freep(reinterpret_cast<void*>(&current_frame_buf));
+					av_frame_free(&current_frame);
+				}
+
+				current_frame = FFMPEG_SCALE::RGB(src_frame, ffmpeg_file->GetVideoCodecContext(), &current_frame_buf, AV_PIX_FMT_BGRA);
+				av_frame_free(&src_frame);
+
+				video_frames_written++;
+
+			}
+
+			if (elapsed_time >= frame_duration) {
+				elapsed_time -= frame_duration;
+			}
+
+		}
 
 	}
 
-	for (int i = 0; i < current_frame->height; ++i) {
-		uint8_t* pixel_ptr = (current_frame->data[0] + i * current_frame->linesize[0]);
-		int fb_offset = i * dumb_buffer->pitch;
-		memcpy(dumb_buffer->fb + fb_offset, pixel_ptr, current_frame->width*4);
-	}
+	if (current_frame != nullptr) {
 
+		for (int i = 0; i < current_frame->height; ++i) {
+			uint8_t* pixel_ptr = (current_frame->data[0] + i * current_frame->linesize[0]);
+			int fb_offset = i * dumb_buffer->pitch;
+			memcpy(dumb_buffer->fb + fb_offset, pixel_ptr, current_frame->width*4);
+		}
+
+	}
 
 	g_frame_nr++;
 
-	printf("%d\n", g_frame_nr);
+	// printf("%d\n", g_frame_nr);
 
 	drmModePageFlip(g_card_fd, g_old_crtc->crtc_id, dumb_buffer->fb_handle, DRM_MODE_PAGE_FLIP_EVENT, NULL);
 
@@ -334,7 +314,7 @@ void draw() {
 
 void flip_handler(int fd, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void* user_data) {
 
-	printf("YO YA\n");
+	// printf("YO YA\n");
 
 	draw();
 
@@ -346,65 +326,111 @@ void audio_playback_T() {
 
 	int err;
 	unsigned int i;
-	snd_pcm_t *handle;
+	snd_pcm_t *pcm_handle;
 	snd_pcm_sframes_t frames;
+	int ret;
 
-	if ((err = snd_pcm_open(&handle, audio_device, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
-		printf("Playback open error: %s\n", snd_strerror(err));
-		return;
+	// if ((err = snd_pcm_open(&handle, audio_device, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+	// 	printf("Playback open error: %s\n", snd_strerror(err));
+	// 	return;
+	// }
+
+	// if ((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 6, 48000, 1, 500000)) < 0) {   /* 0.5sec */
+	// 	printf("Playback open error: %s\n", snd_strerror(err));
+	// 	return;
+	// }
+
+	if ((ret = snd_pcm_open(&pcm_handle, audio_device, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+		printf("snd_pcm_open() failed. %s.\n", snd_strerror(ret));
 	}
 
-	if ((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 6, 48000, 1, 500000)) < 0) {   /* 0.5sec */
-		printf("Playback open error: %s\n", snd_strerror(err));
-		return;
+	// TODO: error checking
+	snd_pcm_hw_params_t* pcm_hw_params;
+	snd_pcm_hw_params_alloca(&pcm_hw_params);
+	snd_pcm_hw_params_any(pcm_handle, pcm_hw_params);
+
+	snd_pcm_hw_params_set_access(pcm_handle, pcm_hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
+	snd_pcm_hw_params_set_format(pcm_handle, pcm_hw_params, SND_PCM_FORMAT_FLOAT_LE);
+	snd_pcm_hw_params_set_rate(pcm_handle, pcm_hw_params, 48000, 0);
+	snd_pcm_hw_params_set_channels(pcm_handle, pcm_hw_params, 6);
+	snd_pcm_hw_params_set_periods(pcm_handle, pcm_hw_params, 16, 0);
+	snd_pcm_hw_params_set_buffer_size(pcm_handle, pcm_hw_params, 4000);
+
+	if ((ret = snd_pcm_hw_params(pcm_handle, pcm_hw_params)) < 0) {
+		printf("snd_pcm_hw_params() failed. %s.\n", snd_strerror(ret));
 	}
 
 	AVFrame* frame = nullptr;
+	int samples_written = 0;
 
 	while (!audio_close) {
 
-		frame = ffmpeg_file->AsyncReadAudio(); 
+		if (!playback_paused) {
 
-		int sample_size = av_get_bytes_per_sample(static_cast<AVSampleFormat>(frame->format));
-		int buffer_size = sample_size * frame->ch_layout.nb_channels * frame->nb_samples;
-		int padded_buffer_size = ((buffer_size / 4096) * 4096) + 4096;
-		uint8_t buf[padded_buffer_size];
-		uint8_t* buf_pos = &buf[0];
-		int offset = 0;
+			frame = ffmpeg_file->AsyncReadAudio();
+			if (frame == nullptr) continue;
 
-		for (int i = 0; i < frame->nb_samples; ++i) {
-			// for (int j = 0; j < frame->ch_layout.nb_channels; ++j) {
-			// 	memcpy(buf_pos, &frame->extended_data[j][offset], sample_size);
-			// 	buf_pos += sample_size;
-			// }
-			memcpy(buf_pos, &frame->extended_data[0][offset], sample_size);
-			buf_pos += sample_size;
-			memcpy(buf_pos, &frame->extended_data[1][offset], sample_size);
-			buf_pos += sample_size;
-			memcpy(buf_pos, &frame->extended_data[4][offset], sample_size);
-			buf_pos += sample_size;
-			memcpy(buf_pos, &frame->extended_data[5][offset], sample_size);
-			buf_pos += sample_size;
-			memcpy(buf_pos, &frame->extended_data[2][offset], sample_size);
-			buf_pos += sample_size;
-			memcpy(buf_pos, &frame->extended_data[3][offset], sample_size);
-			buf_pos += sample_size;
-			offset += sample_size;
+			int sample_size = av_get_bytes_per_sample(static_cast<AVSampleFormat>(frame->format));
+			int buffer_size = sample_size * frame->ch_layout.nb_channels * frame->nb_samples;
+			int padded_buffer_size = ((buffer_size / 4096) * 4096) + 4096;
+			uint8_t buf[padded_buffer_size];
+			uint8_t* buf_pos = &buf[0];
+			int offset = 0;
+
+			samples_written += frame->nb_samples;
+
+			for (int i = 0; i < frame->nb_samples; ++i) {
+				// for (int j = 0; j < frame->ch_layout.nb_channels; ++j) {
+				// 	memcpy(buf_pos, &frame->extended_data[j][offset], sample_size);
+				// 	buf_pos += sample_size;
+				// }
+				memcpy(buf_pos, &frame->extended_data[0][offset], sample_size);
+				buf_pos += sample_size;
+				memcpy(buf_pos, &frame->extended_data[1][offset], sample_size);
+				buf_pos += sample_size;
+				memcpy(buf_pos, &frame->extended_data[4][offset], sample_size);
+				buf_pos += sample_size;
+				memcpy(buf_pos, &frame->extended_data[5][offset], sample_size);
+				buf_pos += sample_size;
+				memcpy(buf_pos, &frame->extended_data[2][offset], sample_size);
+				buf_pos += sample_size;
+				memcpy(buf_pos, &frame->extended_data[3][offset], sample_size);
+				buf_pos += sample_size;
+				offset += sample_size;
+			}
+
+			frames = snd_pcm_writei(pcm_handle, buf, frame->nb_samples);
+			if (frames < 0) frames = snd_pcm_recover(pcm_handle, frames, 0);
+			if (frames < 0) {
+				printf("snd_pcm_writei failed: %s\n", snd_strerror(frames));
+				audio_close = true;
+			}
+			// if (frames > 0 && frames < (long)sizeof(buffer)) printf("Short write (expected %li, wrote %li)\n", (long)sizeof(buffer), frames);
+		
+		}
+		else {
+
+			if (!audio_dropped) {
+
+				snd_pcm_drop(pcm_handle);
+				snd_pcm_prepare(pcm_handle);
+
+				snd_pcm_sframes_t avail_frames = snd_pcm_avail(pcm_handle);
+				printf("Avail frames: %d.\n", static_cast<int>(avail_frames));
+				printf("Samples written: %d.\n", samples_written);
+				printf("Time elapsed: %f.\n", static_cast<float>(samples_written - avail_frames) / 48000.0f);
+
+				audio_dropped = true;
+
+			}
+
 		}
 
-		frames = snd_pcm_writei(handle, buf, frame->nb_samples);
-		if (frames < 0) frames = snd_pcm_recover(handle, frames, 0);
-		if (frames < 0) {
-			printf("snd_pcm_writei failed: %s\n", snd_strerror(frames));
-			audio_close = true;
-		}
-		// if (frames > 0 && frames < (long)sizeof(buffer)) printf("Short write (expected %li, wrote %li)\n", (long)sizeof(buffer), frames);
-	
 	}
 
-	err = snd_pcm_drain(handle);
+	err = snd_pcm_drain(pcm_handle);
 	if (err < 0) printf("snd_pcm_drain failed: %s\n", snd_strerror(err));
-	snd_pcm_close(handle);
+	snd_pcm_close(pcm_handle);
 
 	if (frame != nullptr) av_frame_free(&frame);
 
@@ -412,3 +438,34 @@ void audio_playback_T() {
 
 }
 
+void video_playback_T() {
+
+	while (!process_close) {
+
+		FD_SET(g_card_fd, &fds);
+		int select_ret = select(g_card_fd + 1, &fds, NULL, NULL, &timeout);
+
+		if (select_ret < 0) {
+			fprintf(stderr, "select() failed. %m\n", errno);
+			break;
+		}
+		else {
+			drmHandleEvent(g_card_fd, &event_context);
+		}
+
+	}
+
+	return;
+
+}
+
+void PrintMenu() {
+
+	printf("(P) Pause.\n");
+	printf("(U) Unpause.\n");
+	printf("(S) Seek.\n");
+	printf("Ctrl+C to Quit.\n");
+
+	return;
+
+}

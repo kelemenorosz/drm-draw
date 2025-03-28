@@ -33,11 +33,16 @@ private:
 	int audio_stream_index;
 
 	float audio_time_base;
+	float video_time_base;
 
 	std::thread* recv_packet_T;
 	std::shared_ptr<std::mutex> recv_packet_MTX;
 	std::shared_ptr<std::condition_variable> recv_packet_CV;
 	bool recv_packet_BLK;
+
+	std::mutex* flush_MTX;
+	std::condition_variable* flush_CV;
+	bool flush_BLK;
 
 	void AsyncRecvPacket_T();
 
@@ -48,6 +53,7 @@ public:
 	~FFMPEG_FILE();
 
 	void SeekAudio(int sec);
+	void SeekVideo(int sec);
 
 	AVCodecContext* GetVideoCodecContext();
 

@@ -39,7 +39,16 @@ private:
 
 	std::mutex* send_packet_MTX;
 	std::condition_variable* send_packet_CV;
-	bool send_packet_BLK;
+	bool send_packet_blk;
+
+	std::mutex* flush_MTX;
+	std::condition_variable* flush_CV;
+	bool flush_BLK;
+
+	float time_base;
+
+	void OpenDecoder();
+	void CloseDecoder();
 
 public:
 
@@ -54,7 +63,11 @@ public:
 	AVFrame* AsyncRead();
 	void AsyncSendPacket_T();
 	void PushQueue(AVPacket* packet);
+	void Seek(int sec);
 	AVCodecContext* GetCodecContext();
+
+	void FlushDecoder();
+	void StartDecoder();
 
 	AVStream* stream;
 

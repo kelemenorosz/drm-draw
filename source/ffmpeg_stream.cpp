@@ -11,6 +11,40 @@ FFMPEG_STREAM::FFMPEG_STREAM(AVStream* stream) : stream(stream), state(FF_DEFAUL
 		return;
 	}
 
+	OpenDecoder();
+
+	const char* str = nullptr;
+	str = av_get_pix_fmt_name(codec_ctx->pix_fmt);
+	printf("Decoder format: %s.\n", str);
+
+	str = avcodec_get_name(codec_ctx->codec_id);
+	printf("Decoder name: %s.\n", str);
+
+	recv_frame = av_frame_alloc();
+	if (recv_frame == nullptr) {
+		printf("Failed to allocate receive frame.\n");
+		return;
+	}
+
+	AVRational* time_base_av_r = &stream->time_base;
+	time_base = static_cast<float>(time_base_av_r->num) / static_cast<float>(time_base_av_r->den);
+
+	state = FF_ACTIVE;
+	return;
+
+}
+
+FFMPEG_STREAM::~FFMPEG_STREAM() {
+
+	if (codec_ctx != nullptr) avcodec_free_context(&codec_ctx);
+	if (recv_frame != nullptr) av_frame_free(&recv_frame);
+
+	return;
+
+}
+
+void FFMPEG_STREAM::OpenDecoder() {
+
 	// -- Allocate codec context
 
 	codec_ctx = avcodec_alloc_context3(codec);
@@ -33,28 +67,14 @@ FFMPEG_STREAM::FFMPEG_STREAM(AVStream* stream) : stream(stream), state(FF_DEFAUL
 		return;
 	}
 
-	const char* str = nullptr;
-	str = av_get_pix_fmt_name(codec_ctx->pix_fmt);
-	printf("Decoder format: %s.\n", str);
-
-	str = avcodec_get_name(codec_ctx->codec_id);
-	printf("Decoder name: %s.\n", str);
-
-	recv_frame = av_frame_alloc();
-	if (recv_frame == nullptr) {
-		printf("Failed to allocate receive frame.\n");
-		return;
-	}
-
-	state = FF_ACTIVE;
 	return;
 
 }
 
-FFMPEG_STREAM::~FFMPEG_STREAM() {
+void FFMPEG_STREAM::CloseDecoder() {
 
 	if (codec_ctx != nullptr) avcodec_free_context(&codec_ctx);
-	if (recv_frame != nullptr) av_frame_free(&recv_frame);
+	codec_ctx = nullptr;
 
 	return;
 
@@ -90,6 +110,11 @@ void FFMPEG_STREAM::AsyncDecode(std::shared_ptr<std::mutex> recv_packet_MTX, std
 	send_packet_MTX = new std::mutex();
 	send_packet_CV = new std::condition_variable();
 
+	// -- Allocate FFMPEG_STREAM flush MTX and CV
+
+	flush_MTX = new std::mutex();
+	flush_CV = new std::condition_variable();
+
 	// -- Set state to FF_DECODE
 
 	state = FF_DECODE;
@@ -110,8 +135,8 @@ void FFMPEG_STREAM::StopAsyncDecode() {
 
 	{
 		std::unique_lock<std::mutex> u_lock(*send_packet_MTX);
-		printf("Unlocking AsyncSendPacket_T.\n");
-		send_packet_BLK = false;
+		// printf("Unlocking AsyncSendPacket_T.\n");
+		send_packet_blk = false;
 		send_packet_CV->notify_all();
 	}
 
@@ -128,26 +153,49 @@ void FFMPEG_STREAM::AsyncSendPacket_T() {
 	printf("AsyncSendPacket_T started.\n");
 	int ret;
 
-	while (state == FF_DECODE) {
+	while (state == FF_DECODE || state == FF_FLUSH) {
 
+		if (state == FF_FLUSH) {
+			{
+				std::unique_lock<std::mutex> u_lock(*flush_MTX);
+				// -- Notify FlushDecoder()
+				flush_BLK = false;
+				flush_CV->notify_all();
+			}
+			{
+				std::unique_lock<std::mutex> u_lock(*send_packet_MTX);
+				// -- Suspend thread
+				send_packet_blk = true;
+				send_packet_CV->wait(u_lock, [this] { return !send_packet_blk; });
+			}
+		}
+
+		// -- If queue is empty notify recv_packet()
+		if (queue.size() == 0) {
+			std::unique_lock<std::mutex> u_lock(*recv_packet_MTX);
+			*recv_packet_BLK = false;
+			recv_packet_CV->notify_all();
+			continue;
+		}
+
+		// -- Get packet from queue and send to decoder
 		{
 			std::lock_guard<std::mutex> lg(*recv_packet_MTX);
 			std::lock_guard<std::mutex> lg_2(*send_packet_MTX);
-			if (queue.size() == 0) continue;
 			ret = avcodec_send_packet(codec_ctx, &queue.front());
 		}
 
 		if (ret == 0) {
-			printf("Sending packet.\n");
+			// printf("Sending packet.\n");
 			av_packet_unref(&queue.front());
 			queue.pop();
 		}
 		else if (ret == AVERROR(EAGAIN)) {
 
 			std::unique_lock<std::mutex> u_lock(*send_packet_MTX);
-			printf("Locking AsyncSendPacket_T.\n");
-			send_packet_BLK = true;
-			send_packet_CV->wait(u_lock, [this] { return !send_packet_BLK; });
+			// printf("Locking AsyncSendPacket_T.\n");
+			send_packet_blk = true;
+			send_packet_CV->wait(u_lock, [this] { return !send_packet_blk; });
 
 		}
 		else {
@@ -157,7 +205,7 @@ void FFMPEG_STREAM::AsyncSendPacket_T() {
 		if (queue.size() < 50) {
 
 			std::unique_lock<std::mutex> u_lock(*recv_packet_MTX);
-			printf("Unlocking AsyncRecvPacket_T.\n");
+			// printf("Unlocking AsyncRecvPacket_T.\n");
 			*recv_packet_BLK = false;
 			recv_packet_CV->notify_all();
 
@@ -173,20 +221,26 @@ void FFMPEG_STREAM::AsyncSendPacket_T() {
 
 AVFrame* FFMPEG_STREAM::AsyncRead() {
 
-	printf("AsyncRead().\n");
+	// printf("AsyncRead().\n");
 	int ret;
 
 	while (1) {
 
+		if (state == FF_FLUSH) {
+			// If decoder is being flushed, don't read
+			return nullptr;
+		}
+
 		{
 			std::lock_guard<std::mutex> lg(*send_packet_MTX);
+			std::lock_guard<std::mutex> lg_2(*flush_MTX);
 			ret = avcodec_receive_frame(codec_ctx, recv_frame);
 		}
 		if (ret != 0) {
 			if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
 				std::unique_lock<std::mutex> u_lock(*send_packet_MTX);
 				// printf("Frame not yet available.\n");
-				send_packet_BLK = false;
+				send_packet_blk = false;
 				send_packet_CV->notify_all();
 			}
 			else {
@@ -201,7 +255,7 @@ AVFrame* FFMPEG_STREAM::AsyncRead() {
 
 	}
 
-	printf("Frame received.\n");
+	// printf("Frame received.\n");
 
 	AVFrame* frame = av_frame_alloc();
 	if (frame == NULL) {
@@ -214,11 +268,68 @@ AVFrame* FFMPEG_STREAM::AsyncRead() {
 
 	{
 		std::unique_lock<std::mutex> u_lock(*send_packet_MTX);
-		printf("Unlocking AsyncSendPacket_T.\n");
-		send_packet_BLK = false;
+		// printf("Unlocking AsyncSendPacket_T.\n");
+		send_packet_blk = false;
 		send_packet_CV->notify_all();
 	}
 
 	return frame;
+
+}
+
+
+void FFMPEG_STREAM::FlushDecoder() {
+
+	printf("Flushing decoder.\n");
+
+	// -- Aquire flush MTX
+	{
+		std::unique_lock<std::mutex> u_lock(*flush_MTX);
+		// -- Set state to flush
+		state = FF_FLUSH;
+		{
+			std::unique_lock<std::mutex> u_lock2(*send_packet_MTX);
+			send_packet_blk = false;
+			send_packet_CV->notify_all();
+		}
+		// -- Wait for SendPacket() to acknowledge
+		flush_BLK = true;
+		flush_CV->wait(u_lock, [this]{ return !flush_BLK; });
+	}
+
+	// -- Flush decoder
+
+	// -- Aquire flush MTX
+	{
+		std::lock_guard<std::mutex> lg(*flush_MTX);
+		CloseDecoder();
+		OpenDecoder();
+	}
+
+	// -- Clean queue
+	queue = {};
+
+	return;
+
+}
+
+void FFMPEG_STREAM::StartDecoder() {
+
+	state = FF_DECODE;
+
+	// -- Notify send_packet
+	{
+		std::unique_lock<std::mutex> u_lock(*send_packet_MTX);
+		send_packet_blk = false;
+		send_packet_CV->notify_all();
+	}
+
+	return;
+
+}
+
+void FFMPEG_STREAM::Seek(int sec) {
+
+	return;
 
 }
