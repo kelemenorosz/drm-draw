@@ -24,13 +24,16 @@ private:
 	FFMPEG_STATE state;
 
 	FFMPEG_STREAM* video_stream;
-	FFMPEG_STREAM* audio_stream;
+	// FFMPEG_STREAM* audio_stream;
+	std::vector<std::pair<int, FFMPEG_STREAM*>> audio_streams;
+	int active_audio;
+	int frames_read_audio;
 
 	AVFormatContext* format_ctx;
 	AVPacket recv_packet;
 
 	int video_stream_index;
-	int audio_stream_index;
+	// int audio_stream_index;
 
 	float audio_time_base;
 	float video_time_base;
@@ -53,9 +56,16 @@ public:
 	~FFMPEG_FILE();
 
 	void SeekAudio(int sec);
-	void SeekVideo(int sec);
+	float SeekVideo(int sec);
+
+	float SwitchAudio(int stream, float sec);
 
 	AVCodecContext* GetVideoCodecContext();
+	int GetSampleRate();
+	int GetChannelNb();
+	AVSampleFormat GetSampleFormat();
+
+	int GetAudioTrackNb();
 
 	void AsyncDecode();
 	void StopAsyncDecode();

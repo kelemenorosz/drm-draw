@@ -20,6 +20,10 @@ FFMPEG_STREAM::FFMPEG_STREAM(AVStream* stream) : stream(stream), state(FF_DEFAUL
 	str = avcodec_get_name(codec_ctx->codec_id);
 	printf("Decoder name: %s.\n", str);
 
+	printf("Sample format: %s.\n", av_get_sample_fmt_name(codec_ctx->sample_fmt));
+	printf("Sample rate: %d.\n", codec_ctx->sample_rate);
+	printf("Nb. of channels: %d.\n", codec_ctx->ch_layout.nb_channels);
+
 	recv_frame = av_frame_alloc();
 	if (recv_frame == nullptr) {
 		printf("Failed to allocate receive frame.\n");
@@ -80,6 +84,18 @@ void FFMPEG_STREAM::CloseDecoder() {
 
 }
 
+int FFMPEG_STREAM::GetSampleRate() {
+	return codec_ctx->sample_rate;
+}
+
+int FFMPEG_STREAM::GetChannelNb() {
+	return codec_ctx->ch_layout.nb_channels;
+}
+
+AVSampleFormat FFMPEG_STREAM::GetSampleFormat() {
+	return codec_ctx->sample_fmt;
+}
+
 FFMPEG_STATE FFMPEG_STREAM::GetState() {
 	return state;
 }
@@ -115,9 +131,9 @@ void FFMPEG_STREAM::AsyncDecode(std::shared_ptr<std::mutex> recv_packet_MTX, std
 	flush_MTX = new std::mutex();
 	flush_CV = new std::condition_variable();
 
-	// -- Set state to FF_DECODE
+	// -- Set state to FF_FLUSH
 
-	state = FF_DECODE;
+	state = FF_FLUSH;
 
 	// -- Start async thread
 
@@ -228,6 +244,7 @@ AVFrame* FFMPEG_STREAM::AsyncRead() {
 
 		if (state == FF_FLUSH) {
 			// If decoder is being flushed, don't read
+			// printf("Decoder flushed.\n");
 			return nullptr;
 		}
 

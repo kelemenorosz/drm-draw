@@ -13,7 +13,7 @@ extern "C" {
 
 namespace FFMPEG_SCALE {
 
-    AVFrame* RGB(AVFrame* src, AVCodecContext* codec, uint8_t** buf, AVPixelFormat format);
+	AVFrame* RGB(AVFrame* src, AVCodecContext* codec, uint8_t** buf, AVPixelFormat format, int width, int height);
 
 }
 

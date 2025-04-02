@@ -66,6 +66,10 @@ public:
 	void Seek(int sec);
 	AVCodecContext* GetCodecContext();
 
+	int GetSampleRate();
+	int GetChannelNb();
+	AVSampleFormat GetSampleFormat();
+
 	void FlushDecoder();
 	void StartDecoder();
 

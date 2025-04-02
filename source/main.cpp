@@ -24,7 +24,6 @@ FFMPEG_FILE* ffmpeg_file = nullptr;
 std::thread* audio_T = nullptr;
 std::thread* video_T = nullptr;
 bool audio_close = false;
-const char* audio_device = "YAYplug";
 bool process_close = false;
 std::chrono::high_resolution_clock::time_point t0;
 double elapsed_time = 0.0f;
@@ -37,11 +36,15 @@ drmEventContext event_context;
 bool playback_paused = true;
 bool audio_dropped = false;
 int video_frames_written = 0;
+float current_pos = 0.0f;
+int frames_read = 0;
+int display_height = 0;
+int display_width = 0;
 
 void PrintMenu();
 void draw();
 void flip_handler(int fd, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void* user_data);
-void audio_playback_T();
+void audio_playback_T(const char* dev_str);
 void video_playback_T();
 
 void sigint_handler(int sig) {
@@ -59,7 +62,7 @@ int main(int argc, const char* argv[]) {
 
 	int ret = 0;
 
-	if (argc != 3) {
+	if (argc != 4) {
 	
 		std::cout << "Invalid args." << std::endl;
 		return 1;
@@ -79,7 +82,7 @@ int main(int argc, const char* argv[]) {
 
 	// -- Open video file 
 	
-	ffmpeg_file = new FFMPEG_FILE(argv[2]);
+	ffmpeg_file = new FFMPEG_FILE(argv[3]);
 	// ffmpeg_file->SeekVideo(180);
 	ffmpeg_file->AsyncDecode();
 
@@ -166,6 +169,35 @@ int main(int argc, const char* argv[]) {
 
 	t0 = std::chrono::high_resolution_clock::now();
 
+	// -- Get scale
+
+	int video_height = ffmpeg_file->GetVideoCodecContext()->height;
+	int video_width = ffmpeg_file->GetVideoCodecContext()->width;
+	int screen_height = mode_info->vdisplay;
+	int screen_width = mode_info->hdisplay;
+
+	float video_ratio = static_cast<float>(video_width) / static_cast<float>(video_height);
+	float screen_ratio = static_cast<float>(screen_width) / static_cast<float>(screen_height);
+
+	int hscale_height = screen_height;
+	int hscale_width = static_cast<float>(hscale_height) * video_ratio;
+
+	int wscale_width = screen_width;
+	int wscale_height = static_cast<float>(wscale_width) / video_ratio;
+
+	if ((video_height == screen_height) && (video_width == screen_width)) {
+		display_height = video_height;
+		display_width = video_width;
+	}
+	else if (hscale_width > screen_width) {
+		display_height = wscale_height;
+		display_width = wscale_width;
+	}
+	else {
+		display_height = hscale_height;
+		display_width = hscale_width;
+	}
+
 	// -- First draw
 
 	draw();
@@ -173,7 +205,7 @@ int main(int argc, const char* argv[]) {
 	playback_paused = false;
 
 	// -- Start audio playback thread
-	audio_T = new std::thread(audio_playback_T);
+	audio_T = new std::thread(audio_playback_T, argv[2]);
 
 	// -- Start video playback thread
 	video_T = new std::thread(video_playback_T);
@@ -185,6 +217,8 @@ int main(int argc, const char* argv[]) {
 		std::string input_string;
 		std::string seek_string;
 		int seek_sec;
+		int switch_track;
+		float switch_sec;
 		std::getline(std::cin, input_string);
 		if (input_string.size() == 0) {
 			// --
@@ -210,7 +244,21 @@ int main(int argc, const char* argv[]) {
 					std::getline(std::cin, seek_string);
 					seek_sec = std::stoi(seek_string);
 					playback_paused = true;
-					ffmpeg_file->SeekVideo(seek_sec);
+					current_pos = ffmpeg_file->SeekVideo(seek_sec);
+					frames_read = 0;
+					playback_paused = false;
+					audio_dropped = false;
+					break;
+				case 'A':
+				case 'a':
+					std::cout << "Audio tracks: " << ffmpeg_file->GetAudioTrackNb() << std::endl;
+					std::cout << "Switch to track (0--?): ";
+					std::getline(std::cin, seek_string);
+					switch_track = std::stoi(seek_string);
+					playback_paused = true;
+					switch_sec = current_pos + (1 / static_cast<float>(ffmpeg_file->GetSampleRate())) * static_cast<float>(frames_read);
+					current_pos = ffmpeg_file->SwitchAudio(switch_track, switch_sec);
+					frames_read = 0;
 					playback_paused = false;
 					audio_dropped = false;
 					break;
@@ -279,7 +327,7 @@ void draw() {
 					av_frame_free(&current_frame);
 				}
 
-				current_frame = FFMPEG_SCALE::RGB(src_frame, ffmpeg_file->GetVideoCodecContext(), &current_frame_buf, AV_PIX_FMT_BGRA);
+				current_frame = FFMPEG_SCALE::RGB(src_frame, ffmpeg_file->GetVideoCodecContext(), &current_frame_buf, AV_PIX_FMT_BGRA, display_width, display_height);
 				av_frame_free(&src_frame);
 
 				video_frames_written++;
@@ -322,7 +370,7 @@ void flip_handler(int fd, unsigned int sequence, unsigned int tv_sec, unsigned i
 
 }
 
-void audio_playback_T() {
+void audio_playback_T(const char* dev_str) {
 
 	int err;
 	unsigned int i;
@@ -340,7 +388,7 @@ void audio_playback_T() {
 	// 	return;
 	// }
 
-	if ((ret = snd_pcm_open(&pcm_handle, audio_device, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+	if ((ret = snd_pcm_open(&pcm_handle, dev_str, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
 		printf("snd_pcm_open() failed. %s.\n", snd_strerror(ret));
 	}
 
@@ -350,9 +398,27 @@ void audio_playback_T() {
 	snd_pcm_hw_params_any(pcm_handle, pcm_hw_params);
 
 	snd_pcm_hw_params_set_access(pcm_handle, pcm_hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
-	snd_pcm_hw_params_set_format(pcm_handle, pcm_hw_params, SND_PCM_FORMAT_FLOAT_LE);
-	snd_pcm_hw_params_set_rate(pcm_handle, pcm_hw_params, 48000, 0);
-	snd_pcm_hw_params_set_channels(pcm_handle, pcm_hw_params, 6);
+	if (ffmpeg_file->GetSampleFormat() == AV_SAMPLE_FMT_FLTP) {
+		snd_pcm_hw_params_set_format(pcm_handle, pcm_hw_params, SND_PCM_FORMAT_FLOAT_LE);
+	}
+	else {
+		printf("Sample format unrecognized.\n");
+		return;
+	}
+	if (ffmpeg_file->GetSampleRate() != 0) {
+		snd_pcm_hw_params_set_rate(pcm_handle, pcm_hw_params, ffmpeg_file->GetSampleRate(), 0);
+	}
+	else {
+		printf("Unknown sample rate.\n");
+		return;
+	}
+	if (ffmpeg_file->GetChannelNb() != 0) {
+		snd_pcm_hw_params_set_channels(pcm_handle, pcm_hw_params, ffmpeg_file->GetChannelNb());
+	}
+	else {
+		printf("Unknown channel nb.\n");
+		return;
+	}
 	snd_pcm_hw_params_set_periods(pcm_handle, pcm_hw_params, 16, 0);
 	snd_pcm_hw_params_set_buffer_size(pcm_handle, pcm_hw_params, 4000);
 
@@ -379,6 +445,8 @@ void audio_playback_T() {
 
 			samples_written += frame->nb_samples;
 
+			// printf("audio_playback_T - Frame recevied.\n");
+
 			for (int i = 0; i < frame->nb_samples; ++i) {
 				// for (int j = 0; j < frame->ch_layout.nb_channels; ++j) {
 				// 	memcpy(buf_pos, &frame->extended_data[j][offset], sample_size);
@@ -388,16 +456,22 @@ void audio_playback_T() {
 				buf_pos += sample_size;
 				memcpy(buf_pos, &frame->extended_data[1][offset], sample_size);
 				buf_pos += sample_size;
-				memcpy(buf_pos, &frame->extended_data[4][offset], sample_size);
-				buf_pos += sample_size;
-				memcpy(buf_pos, &frame->extended_data[5][offset], sample_size);
-				buf_pos += sample_size;
-				memcpy(buf_pos, &frame->extended_data[2][offset], sample_size);
-				buf_pos += sample_size;
-				memcpy(buf_pos, &frame->extended_data[3][offset], sample_size);
-				buf_pos += sample_size;
+				if (frame->ch_layout.nb_channels > 2) {
+					memcpy(buf_pos, &frame->extended_data[4][offset], sample_size);
+					buf_pos += sample_size;
+					memcpy(buf_pos, &frame->extended_data[5][offset], sample_size);
+					buf_pos += sample_size;
+					memcpy(buf_pos, &frame->extended_data[2][offset], sample_size);
+					buf_pos += sample_size;
+					memcpy(buf_pos, &frame->extended_data[3][offset], sample_size);
+					buf_pos += sample_size;
+				}
 				offset += sample_size;
 			}
+
+			// printf("audio_playback_T - Frame interleaved.\n");
+			
+			frames_read += frame->nb_samples;
 
 			frames = snd_pcm_writei(pcm_handle, buf, frame->nb_samples);
 			if (frames < 0) frames = snd_pcm_recover(pcm_handle, frames, 0);
@@ -464,6 +538,7 @@ void PrintMenu() {
 	printf("(P) Pause.\n");
 	printf("(U) Unpause.\n");
 	printf("(S) Seek.\n");
+	printf("(A) Audio tracks.\n");
 	printf("Ctrl+C to Quit.\n");
 
 	return;

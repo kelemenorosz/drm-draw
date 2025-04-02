@@ -6,7 +6,7 @@ extern "C" {
 	#include <libswscale/swscale.h>
 } 
 
-FFMPEG_FILE::FFMPEG_FILE(const char* src) : format_ctx(nullptr), video_stream(nullptr), audio_stream(nullptr), recv_packet_MTX(nullptr), recv_packet_CV(nullptr), recv_packet_T(nullptr), recv_packet_BLK(false) {
+FFMPEG_FILE::FFMPEG_FILE(const char* src) : format_ctx(nullptr), video_stream(nullptr), recv_packet_MTX(nullptr), recv_packet_CV(nullptr), recv_packet_T(nullptr), recv_packet_BLK(false), active_audio(0), frames_read_audio(0) {
 
 	state = FF_DEFAULT;
 
@@ -44,9 +44,16 @@ FFMPEG_FILE::FFMPEG_FILE(const char* src) : format_ctx(nullptr), video_stream(nu
 		else if (format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
 			// -- Audio stream
 			printf("Stream nr. %d type audio.\n", i);
-			audio_stream_index = i;
-			audio_stream = new FFMPEG_STREAM(format_ctx->streams[i]);
-			if (audio_stream->GetState() == FF_ACTIVE) audio_codec_setup = true;
+			// audio_stream_index = i;
+			// audio_stream = new FFMPEG_STREAM(format_ctx->streams[i]);
+			audio_streams.emplace_back(i, new FFMPEG_STREAM(format_ctx->streams[i]));
+			if (audio_streams[audio_streams.size() - 1].second->GetState() == FF_ACTIVE) {
+				audio_codec_setup = true;
+				printf("Stream state: ACTIVE.\n");
+			}
+			else {
+				printf("Stream state: NOT ACTIVE.\n");
+			}
 		}
 		else if (format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
 			printf("Stream nr. %d type subtitle.\n", i);
@@ -59,6 +66,8 @@ FFMPEG_FILE::FFMPEG_FILE(const char* src) : format_ctx(nullptr), video_stream(nu
 		}
 	}
 
+	printf("Number of audio streams: %d.\n", audio_streams.size());
+
 	if (!video_codec_setup) return;
 	if (!audio_codec_setup) return;
 
@@ -67,7 +76,9 @@ FFMPEG_FILE::FFMPEG_FILE(const char* src) : format_ctx(nullptr), video_stream(nu
 	printf("Video stream frame rate: %f.\n", frame_rate);
 	video_fps = frame_rate;
 
-	AVRational* time_base_av_r = &audio_stream->stream->time_base;
+	// -- TODO: calculate for every stream
+	// AVRational* time_base_av_r = &audio_stream->stream->time_base;
+	AVRational* time_base_av_r = &audio_streams[0].second->stream->time_base;
 	float time_base = static_cast<float>(time_base_av_r->num) / static_cast<float>(time_base_av_r->den);
 	printf("Audio stream time base: %f.\n", time_base);
 	audio_time_base = time_base;
@@ -85,10 +96,12 @@ FFMPEG_FILE::FFMPEG_FILE(const char* src) : format_ctx(nullptr), video_stream(nu
 FFMPEG_FILE::~FFMPEG_FILE() {
 	
 	printf("video_queue.size() = %d.\n", video_stream->GetQueueSize());
-	printf("audio_queue.size() = %d.\n", audio_stream->GetQueueSize());
+	// printf("audio_queue.size() = %d.\n", audio_stream->GetQueueSize());
+	printf("audio_queue.size() = %d.\n", audio_streams[active_audio].second->GetQueueSize());
+	printf("Audio frames read: %d.\n", frames_read_audio);
 
 	if (video_stream != nullptr) delete video_stream;
-	if (audio_stream != nullptr) delete audio_stream;
+	// if (audio_stream != nullptr) delete audio_stream;
 
 	if (format_ctx != NULL) avformat_close_input(&format_ctx);
 
@@ -103,13 +116,13 @@ FFMPEG_FILE::~FFMPEG_FILE() {
 void FFMPEG_FILE::SeekAudio(int sec) {
 
 	float timestamp_n = static_cast<float>(sec) / audio_time_base;
-	av_seek_frame(format_ctx, audio_stream_index, static_cast<int>(timestamp_n), 0);
+	av_seek_frame(format_ctx, audio_streams[active_audio].first, static_cast<int>(timestamp_n), 0);
 
 	return;
 
 }
 
-void FFMPEG_FILE::SeekVideo(int sec) {
+float FFMPEG_FILE::SeekVideo(int sec) {
 
 	printf("Seeking video.\n");
 
@@ -127,17 +140,56 @@ void FFMPEG_FILE::SeekVideo(int sec) {
 	}
 
 	// -- Flush decoder
-	audio_stream->FlushDecoder();
+	// audio_stream->FlushDecoder();
+	audio_streams[active_audio].second->FlushDecoder();
 	video_stream->FlushDecoder();
 
-	float timestamp_n = static_cast<float>(sec) / video_time_base;
-	av_seek_frame(format_ctx, video_stream_index, static_cast<int>(timestamp_n), 0);
+	int timestamp_n = static_cast<float>(sec) / video_time_base;
+	av_seek_frame(format_ctx, video_stream_index, timestamp_n, 0);
 
 	// -- Start decoder
 	video_stream->StartDecoder();
-	audio_stream->StartDecoder();
+	audio_streams[active_audio].second->StartDecoder();
 
-	return;
+	return (static_cast<float>(timestamp_n) * video_time_base);
+
+}
+
+float FFMPEG_FILE::SwitchAudio(int stream, float sec) {
+
+	printf("Switching audio.\n");
+
+	// -- Wake up RecvPacket() and stop receiveing packets
+	{
+		std::unique_lock<std::mutex> u_lock(*flush_MTX);
+		state = FF_FLUSH;
+		{
+			std::unique_lock<std::mutex> u_lock2(*recv_packet_MTX);
+			recv_packet_BLK = false;
+			recv_packet_CV->notify_all();
+		}
+		flush_BLK = true;
+		flush_CV->wait(u_lock, [this]{ return !flush_BLK; });
+	}
+
+	// -- Flush decoders
+	video_stream->FlushDecoder();
+	audio_streams[active_audio].second->FlushDecoder();
+
+	// -- Seek to current frames read
+	int timestamp_n = sec / video_time_base;
+	printf("timestamp_n: %f.\n", timestamp_n);
+	printf("sec: %f.\n", sec);
+	printf("video time base: %f.\n", video_time_base);
+	av_seek_frame(format_ctx, video_stream_index, timestamp_n, 0);
+
+	active_audio = stream;
+
+	// -- Start decoder
+	video_stream->StartDecoder();
+	audio_streams[active_audio].second->StartDecoder();
+
+	return (static_cast<float>(timestamp_n) * video_time_base);
 
 }
 
@@ -162,11 +214,17 @@ void FFMPEG_FILE::AsyncDecode() {
 	// -- Start stream async threads
 
 	video_stream->AsyncDecode(recv_packet_MTX, recv_packet_CV, &recv_packet_BLK);
-	audio_stream->AsyncDecode(recv_packet_MTX, recv_packet_CV, &recv_packet_BLK);
+	// audio_streams[active_audio].second->AsyncDecode(recv_packet_MTX, recv_packet_CV, &recv_packet_BLK);
+	for (int i = 0; i < audio_streams.size(); ++i) {
+		audio_streams[i].second->AsyncDecode(recv_packet_MTX, recv_packet_CV, &recv_packet_BLK);
+	}
 
 	// -- Start async threads
 
 	recv_packet_T = new std::thread(&FFMPEG_FILE::AsyncRecvPacket_T, this);
+
+	video_stream->StartDecoder();
+	audio_streams[active_audio].second->StartDecoder();
 
 	return;
 
@@ -190,7 +248,7 @@ void FFMPEG_FILE::StopAsyncDecode() {
 	// -- Stop stream async threads
 
 	video_stream->StopAsyncDecode();
-	audio_stream->StopAsyncDecode();
+	audio_streams[active_audio].second->StopAsyncDecode();
 
 	// -- Join threads
 
@@ -238,18 +296,18 @@ void FFMPEG_FILE::AsyncRecvPacket_T() {
 				// printf("video_queue.push() succeeded.\n");
 			}
 		}
-		if (async_recv_packet.stream_index == audio_stream_index) {
+		if (async_recv_packet.stream_index == audio_streams[active_audio].first) {
 			// printf("audio_queue.push().\n");
 			{
 				std::lock_guard<std::mutex> lg(*recv_packet_MTX);
-				audio_stream->PushQueue(&async_recv_packet);
+				audio_streams[active_audio].second->PushQueue(&async_recv_packet);
 			}
 
 		}
 
 		// printf("Video queue size: %d, audio_queue_size: %d.\n", video_stream->GetQueueSize(), audio_stream->GetQueueSize());
 
-		if (video_stream->GetQueueSize() > 100 && audio_stream->GetQueueSize() > 100) {
+		if (video_stream->GetQueueSize() > 100 && audio_streams[active_audio].second->GetQueueSize() > 100) {
 
 			std::unique_lock<std::mutex> u_lock(*recv_packet_MTX);
 			// printf("Locking AsyncRecvPacket_T.\n");
@@ -275,6 +333,23 @@ AVFrame* FFMPEG_FILE::AsyncReadVideo() {
 
 AVFrame* FFMPEG_FILE::AsyncReadAudio() {
 
-	return audio_stream->AsyncRead();
+	frames_read_audio++;
+	return audio_streams[active_audio].second->AsyncRead();
 
+}
+
+int FFMPEG_FILE::GetSampleRate() {
+	return audio_streams[active_audio].second->GetSampleRate();
+}
+
+int FFMPEG_FILE::GetChannelNb() {
+	return audio_streams[active_audio].second->GetChannelNb();
+}
+
+AVSampleFormat FFMPEG_FILE::GetSampleFormat() {
+	return audio_streams[active_audio].second->GetSampleFormat();
+}
+
+int FFMPEG_FILE::GetAudioTrackNb() {
+	return audio_streams.size();
 }
